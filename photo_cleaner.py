@@ -679,7 +679,7 @@ def _find_blocking_processes(mount_path: Path) -> List[str]:
 
 
 class EjectErrorScreen(ModalScreen):
-    """Shown when 'diskutil eject' fails — typically because a process holds
+    """Shown when Finder eject fails — typically because a process holds
     the volume open."""
 
     def __init__(self, mount_path: Path, raw_error: str, blockers: List[str]):
@@ -691,7 +691,7 @@ class EjectErrorScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Container(id="eject_dialog"):
             yield Label(f"Could not eject {self.mount_path}", id="eject_title")
-            error_text = self.raw_error.strip() or "diskutil reported a failure but printed no message."
+            error_text = self.raw_error.strip() or "Finder reported a failure but printed no message."
             yield Static(error_text, id="eject_body")
             if self.blockers:
                 yield Label(
@@ -704,17 +704,11 @@ class EjectErrorScreen(ModalScreen):
                 )
             else:
                 yield Static(
-                    "No specific process detected via lsof. macOS daemons "
-                    "(e.g. mds/Spotlight) may be holding handles that command-"
-                    "line tools can't release — even as root.",
+                    "No specific process detected via lsof. Try ejecting from "
+                    "Finder directly — it sometimes prompts for a force-eject "
+                    "where this scripted call cannot.",
                     id="eject_advice",
                 )
-            yield Static(
-                "Easiest fix: eject from Finder instead. Finder uses privileged "
-                "hooks that command-line diskutil lacks and usually succeeds "
-                "where this tool fails.",
-                id="eject_finder_hint",
-            )
             yield Label("Press any key to close", id="eject_hint")
 
     def on_key(self, event):
@@ -1280,13 +1274,6 @@ class PhotoCleanerApp(App):
         height: auto;
     }
 
-    #eject_finder_hint {
-        color: $success;
-        padding-top: 1;
-        width: 100%;
-        height: auto;
-    }
-
     #eject_hint {
         color: $text-muted;
         padding-top: 1;
@@ -1811,7 +1798,7 @@ class PhotoCleanerApp(App):
             self.run_worker(self._do_eject(), exclusive=True, group="eject")
 
     async def _do_eject(self):
-        """Perform the eject and surface failures via a modal."""
+        """Ask Finder to eject the volume; poll for actual unmount."""
         status = self.query_one("#status", Static)
 
         if sys.platform != "darwin":
@@ -1819,49 +1806,60 @@ class PhotoCleanerApp(App):
             return
 
         mount_path = self.scan_path
+        volume_name = mount_path.name
 
-        # Snapshot blockers BEFORE eject — diskutil may hang and the offending
+        # Snapshot blockers up front — if Finder also fails, the offending
         # process may release/re-acquire by the time we'd query post-failure.
         status.update(f"Checking what has {mount_path} open...")
         pre_blockers = await asyncio.to_thread(_find_blocking_processes, mount_path)
 
-        status.update(f"Ejecting {mount_path}...")
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["diskutil", "eject", str(mount_path)],
-                capture_output=True, text=True, timeout=30,
-            )
-        except subprocess.TimeoutExpired:
-            # Eject hung — usually means a process has the volume open and
-            # macOS is waiting it out. Re-snapshot in case it changed.
-            post_blockers = await asyncio.to_thread(_find_blocking_processes, mount_path)
-            blockers = post_blockers or pre_blockers
-            await self.push_screen_wait(
-                EjectErrorScreen(
-                    mount_path,
-                    "diskutil eject timed out (30s). The volume is likely held open by another process.",
-                    blockers,
-                )
-            )
-            status.update(f"Eject timed out for {mount_path}")
-            return
-        except Exception as e:
-            await self.push_screen_wait(
-                EjectErrorScreen(mount_path, f"Unexpected error: {e}", pre_blockers)
-            )
-            status.update(f"Eject error: {e}")
-            return
+        status.update(f"Asking Finder to eject {mount_path}...")
 
-        if result.returncode == 0:
+        # Address the disk by name. POSIX-file/alias coercion fails once
+        # Finder has already started unmounting, but `disk "<name>"` is
+        # tolerant of partial state.
+        applescript = f'tell application "Finder" to eject disk "{volume_name}"'
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", applescript,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # osascript returns once Finder *accepts* the eject, but the actual
+        # unmount runs asynchronously. Poll the mountpoint either way.
+        deadline = time.monotonic() + 30
+        stdout_b = b""
+        stderr_b = b""
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass  # Finder may be showing a force-eject prompt; keep polling.
+
+        while mount_path.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+
+        if proc.returncode is None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+
+        if not mount_path.exists():
             status.update(f"Successfully ejected {mount_path}. Press 'q' to quit.")
             self.photo_data.clear()
             table = self.query_one(DataTable)
             table.clear()
             return
 
-        # Failure: prefer fresh blockers, fall back to pre-snapshot.
-        raw_error = (result.stderr or result.stdout or "").strip()
+        # Still mounted → Finder couldn't eject it. Build a useful error.
+        raw_error = (stderr_b.decode("utf-8", "replace") or stdout_b.decode("utf-8", "replace")).strip()
+        if not raw_error:
+            raw_error = (
+                "Finder did not unmount the volume within 30s. It may be "
+                "showing a confirmation/force-eject dialog, or a process is "
+                "holding the volume open."
+            )
         post_blockers = await asyncio.to_thread(_find_blocking_processes, mount_path)
         blockers = post_blockers or pre_blockers
         status.update(f"Eject failed for {mount_path} — see dialog")
